@@ -17,7 +17,7 @@
 #include <string.h>
 #include <stdint.h>
 
-/* ---------- binary range coder (carryless, 32-bit) ---------- */
+/* ---------- binary range coder (LZMA-style, carry-propagating) ---------- */
 typedef struct { uint64_t low; uint32_t range; FILE *f; uint64_t cache; int cachesz; } Enc;
 typedef struct { uint32_t code, range; FILE *f; } Dec;
 
@@ -54,8 +54,17 @@ static int dec_bit(Dec *d, uint16_t *p){
 
 /* ---------- model ----------
  * zigzag the residual, code bit-length in adaptive unary, then the mantissa
- * bits, each with its own context. 18 length contexts x 18 bit positions is
- * 342 probabilities, about 700 bytes of state.
+ * bits, each with its own context. Each Model is 20 length probabilities plus
+ * 20x20 mantissa probabilities, 840 bytes. With 25 tooth contexts and 35 jitter
+ * contexts that is 60 models, 50,400 bytes of state in total.
+ *
+ * NOTE: samples are read native-endian via a cast over the byte buffer, and the
+ * .bw container stores its three length fields as native-endian uint32. Both are
+ * fine on any little-endian host (x86, ARM, RISC-V as normally configured), which
+ * is what the WAV format itself assumes. On a big-endian host the codec is still
+ * lossless, but the ratio collapses because the first difference is taken over
+ * byte-swapped samples, and .bw files do not move between hosts of different
+ * endianness.
  */
 #define NLEN 20
 #define MB 5          /* m magnitude buckets */
@@ -83,12 +92,21 @@ static int32_t get_val(Dec *d, Model *m){
 }
 
 /* ---------- WAV handling: header preserved byte-exact ---------- */
+static void *xmalloc(size_t n){
+    void *p = malloc(n ? n : 1);
+    if (!p) { fprintf(stderr,"out of memory (%zu bytes)\n", n); exit(1); }
+    return p;
+}
 static long find_data_chunk(const uint8_t *buf, long n, uint32_t *dlen){
     long p = 12;
     while (p + 8 <= n) {
         uint32_t sz = (uint32_t)buf[p+4] | (uint32_t)buf[p+5]<<8 | (uint32_t)buf[p+6]<<16 | (uint32_t)buf[p+7]<<24;
         if (!memcmp(buf+p,"data",4)) { *dlen = sz; return p+8; }
-        p += 8 + sz + (sz & 1);
+        /* 64-bit so a hostile size field cannot wrap the advance to zero and spin
+         * forever; the advance is always at least 8, so p strictly increases. */
+        uint64_t adv = 8ull + (uint64_t)sz + (sz & 1u);
+        if ((uint64_t)p + adv > (uint64_t)n) return -1;
+        p = (long)((uint64_t)p + adv);
     }
     return -1;
 }
@@ -96,20 +114,24 @@ static long find_data_chunk(const uint8_t *buf, long n, uint32_t *dlen){
 static int do_encode(const char *in, const char *out){
     FILE *fi=fopen(in,"rb"); if(!fi){perror(in);return 1;}
     fseek(fi,0,SEEK_END); long n=ftell(fi); fseek(fi,0,SEEK_SET);
-    uint8_t *buf=malloc(n); if (fread(buf,1,n,fi)!=(size_t)n){fclose(fi);return 1;} fclose(fi);
+    uint8_t *buf=xmalloc((size_t)n); if (fread(buf,1,n,fi)!=(size_t)n){fclose(fi);return 1;} fclose(fi);
     uint32_t dlen; long doff=find_data_chunk(buf,n,&dlen);
     if (doff<0 || doff+(long)dlen>n) { fprintf(stderr,"no data chunk\n"); return 1; }
     long nsamp = dlen/2;
+    /* Code only whole samples. If the data chunk has an odd byte count the final
+     * byte is not part of any sample, so it falls into the verbatim tail along
+     * with anything after the chunk. Before this, that byte was dropped and the
+     * decoder wrote uninitialised heap in its place, silently, with exit 0. */
+    long body = nsamp*2;
     FILE *fo=fopen(out,"wb"); if(!fo){perror(out);return 1;}
-    /* header: magic, header length, data length, tail length, then raw header+tail */
-    long tail = n - (doff + dlen);
+    long tail = n - (doff + body);
     fputc('B',fo); fputc('W',fo); fputc('1',fo); fputc(0,fo);
-    uint32_t hl=(uint32_t)doff, dl=dlen, tl=(uint32_t)tail;
+    uint32_t hl=(uint32_t)doff, dl=(uint32_t)body, tl=(uint32_t)tail;
     fwrite(&hl,4,1,fo); fwrite(&dl,4,1,fo); fwrite(&tl,4,1,fo);
     fwrite(buf,1,doff,fo);
-    if (tail>0) fwrite(buf+doff+dlen,1,tail,fo);
+    if (tail>0) fwrite(buf+doff+body,1,tail,fo);
     Enc e; enc_init(&e,fo);
-    Model *Mm=malloc(sizeof(Model)*NMCTX), *Me=malloc(sizeof(Model)*NRCTX);
+    Model *Mm=xmalloc(sizeof(Model)*NMCTX), *Me=xmalloc(sizeof(Model)*NRCTX);
     for (int i=0;i<NMCTX;i++) model_init(&Mm[i]);
     for (int i=0;i<NRCTX;i++) model_init(&Me[i]);
     int b1=0,b2=0,pr=0;
@@ -135,11 +157,17 @@ static int do_decode(const char *in, const char *out){
     int c0=fgetc(fi),c1=fgetc(fi),c2=fgetc(fi); fgetc(fi);
     if (c0!='B'||c1!='W'||c2!='1'){fprintf(stderr,"bad magic\n");return 1;}
     uint32_t hl,dl,tl; if(fread(&hl,4,1,fi)!=1||fread(&dl,4,1,fi)!=1||fread(&tl,4,1,fi)!=1) return 1;
-    uint8_t *hdr=malloc(hl); if (fread(hdr,1,hl,fi)!=hl) return 1;
-    uint8_t *tail=NULL; if (tl){ tail=malloc(tl); if (fread(tail,1,tl,fi)!=tl) return 1; }
-    long nsamp=dl/2; int16_t *s=malloc(dl);
+    /* hl, dl and tl come straight out of the file. Bound them against its real
+     * size before allocating, so a corrupt or hostile .bw cannot ask for
+     * gigabytes or spin the decode loop for hours. */
+    long here=ftell(fi); fseek(fi,0,SEEK_END); long fsz=ftell(fi); fseek(fi,here,SEEK_SET);
+    if ((uint64_t)hl + tl > (uint64_t)fsz || (dl & 1u) ||
+        (uint64_t)dl > 64ull*1024*1024*1024) { fprintf(stderr,"corrupt stream\n"); return 1; }
+    uint8_t *hdr=xmalloc(hl); if (fread(hdr,1,hl,fi)!=hl) return 1;
+    uint8_t *tail=NULL; if (tl){ tail=xmalloc(tl); if (fread(tail,1,tl,fi)!=tl) return 1; }
+    long nsamp=dl/2; int16_t *s=xmalloc(dl);
     Dec d; dec_init(&d,fi);
-    Model *Mm=malloc(sizeof(Model)*NMCTX), *Me=malloc(sizeof(Model)*NRCTX);
+    Model *Mm=xmalloc(sizeof(Model)*NMCTX), *Me=xmalloc(sizeof(Model)*NRCTX);
     for (int i=0;i<NMCTX;i++) model_init(&Mm[i]);
     for (int i=0;i<NRCTX;i++) model_init(&Me[i]);
     int b1=0,b2=0,pr=0;
@@ -155,8 +183,10 @@ static int do_decode(const char *in, const char *out){
     }
     fclose(fi);
     FILE *fo=fopen(out,"wb"); if(!fo){perror(out);return 1;}
-    fwrite(hdr,1,hl,fo); fwrite(s,1,dl,fo); if (tl) fwrite(tail,1,tl,fo);
-    fclose(fo); free(hdr); free(s); free(tail); return 0;
+    int wok = (fwrite(hdr,1,hl,fo)==hl) && (fwrite(s,1,dl,fo)==dl)
+              && (!tl || fwrite(tail,1,tl,fo)==tl);
+    if (fclose(fo)!=0 || !wok) { fprintf(stderr,"short write to %s\n",out); return 1; }
+    free(hdr); free(s); free(tail); return 0;
 }
 
 int main(int argc,char**argv){

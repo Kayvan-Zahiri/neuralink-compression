@@ -1,4 +1,6 @@
 brainwire
+brainwire[- ]*[0-9]*
 data/
 *.bw
 *.dec.wav
+*.o

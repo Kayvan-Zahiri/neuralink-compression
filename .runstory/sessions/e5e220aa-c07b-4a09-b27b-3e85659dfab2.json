@@ -1,0 +1,31 @@
+{
+  "session_id": "e5e220aa-c07b-4a09-b27b-3e85659dfab2",
+  "started_at": 1789010433.6991,
+  "transcript_path": "/Users/kayvan/.claude/projects/-Users-kayvan-Desktop-jobs/e5e220aa-c07b-4a09-b27b-3e85659dfab2.jsonl",
+  "sequence": 0,
+  "baseline": {
+    "tree": "5fd3cea8c7f86b524f935530fb125b000b1cf546",
+    "head": "deedcd9f57df70e80351c5943412bc9286526f00",
+    "branch": "master",
+    "dirty": [],
+    "untracked": []
+  },
+  "session_baseline": {
+    "tree": "5fd3cea8c7f86b524f935530fb125b000b1cf546",
+    "head": "deedcd9f57df70e80351c5943412bc9286526f00",
+    "branch": "master",
+    "dirty": [],
+    "untracked": []
+  },
+  "prompts": [
+    {
+      "at": 1789010433.699522,
+      "text": "audit i"
+    },
+    {
+      "at": 1789010438.51616,
+      "text": "audit it"
+    }
+  ],
+  "forced": []
+}

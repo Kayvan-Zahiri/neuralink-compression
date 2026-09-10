@@ -99,8 +99,35 @@ band-limited lossy coding — which is a product decision about what the downstr
 decoder needs, not a compression problem. What is here is the lossless floor,
 measured, with the cost structure an implant would care about.
 
+## Correctness and limits
+
+`./test.sh` covers the cases an audit of this codec turned up. Three real bugs were
+found and fixed, and the tests exist so they stay fixed:
+
+- **An odd-sized data chunk silently lost its last byte**, and the decoder wrote
+  uninitialised heap in its place, with exit status 0. Whole samples are now coded
+  and any trailing odd byte rides along in the verbatim tail. No file in the
+  challenge corpus has an odd data chunk, so the 2.791x result was never affected,
+  but the unqualified "lossless" claim was wrong until this was fixed.
+- **A hostile chunk size field spun `find_data_chunk` forever.** `8 + sz + (sz&1)`
+  was evaluated in 32-bit, so `sz = 0xFFFFFFF8` advanced the cursor by zero. The
+  walk is 64-bit and bounds-checked now.
+- **`eval.sh` exited 0 after a round-trip failure** and still printed a ratio, so a
+  broken build looked like a passing one. It now exits non-zero and prints nothing.
+
+Also hardened: every allocation is checked, the decoder bounds the length fields it
+reads out of a `.bw` before allocating, and short writes are detected rather than
+silently truncating output.
+
+**Endianness.** Samples are read native-endian and the `.bw` header stores its
+length fields as native-endian `uint32`. That is fine on any little-endian host,
+which is what WAV itself assumes. On a big-endian host the codec stays lossless but
+the ratio collapses, since the first difference would be taken over byte-swapped
+samples, and `.bw` files do not move between hosts of differing endianness.
+
 ## Files
 
-- `brainwire.c` — codec, ~180 lines, no dependencies beyond libc
+- `brainwire.c` — codec, ~190 lines, no dependencies beyond libc
 - `encode` / `decode` — the interface `eval.sh` expects
 - `eval.sh` — losslessness check and ratio, portable to Linux and macOS
+- `test.sh` — regression tests for the audit findings
