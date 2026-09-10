@@ -28,20 +28,20 @@ for the head-to-head, hence 2.794.)
 
 ## What the data actually looks like
 
-Measured over 743 files, ~73M samples, 19,531 Hz mono, 16-bit container:
+Measured over **all 743 files**, 73,383,917 samples, 19,531 Hz mono, 16-bit container:
 
-1. **The samples sit on a 64-step lattice.** 72.8% of first differences are exact
-   multiples of 64, and 99.98% are `64k`, `64k+1` or `64k-1`. `round(x/64)` takes
-   only 256 distinct values. That is the 10-bit ADC showing through a 16-bit file.
-2. **Because of the lattice, a = 1.0 is the optimal first-order coefficient.** A
-   grid search over fractional one- and two-tap predictors put plain first
-   difference first at 5.50 bits/sample; the next best fractional coefficient cost
-   7.89 bits. Fractional and LPC predictors break lattice alignment and *lose*
-   3 to 5 bits per sample. This is why the usual FLAC/Shorten playbook underperforms
-   here.
+1. **The samples sit on a 64-step lattice.** 67.8% of first differences are exact
+   multiples of 64, and 99.27% are `64k`, `64k+1` or `64k-1`. Per file, `round(x/64)`
+   takes 52 to 1009 distinct values, mean 186. That is the 10-bit ADC showing through
+   a 16-bit file.
+2. **Because of the lattice, a = 1.0 is the optimal first-order coefficient.** A grid
+   search over one- and two-tap coefficients put plain first difference first at
+   5.539 bits/sample. The cheapest alternative coefficient costs +2.4 bits and the
+   worst +4.6. Fractional and LPC predictors break lattice alignment, which is why
+   the usual FLAC/Shorten playbook underperforms here.
 3. **The residual is near-memoryless in magnitude.** Conditioning first-difference
-   entropy on one, two or three previous magnitude buckets moved it from 5.504 to
-   5.482 bits, so classical activity context modeling buys essentially nothing.
+   entropy on one, two or three previous magnitude buckets moves it from 5.540 to
+   5.529 bits, so classical activity context modeling buys essentially nothing.
 
 ## Design
 
@@ -66,17 +66,20 @@ geometric.
 
 ## Where the remaining headroom is, and is not
 
-Measured conditional entropies over the corpus put this decomposition's floor at
-about **2.98x**: `H(m | prev, prev2)` is 4.562 bits and `H(r | m, prev r)` is 0.808.
-The coder reaches 2.79 against that, so roughly 94% of its own model's ceiling.
+Measured conditional entropies, using the exact context definitions the codec ships
+with, put this decomposition's floor at **2.868x**: over 200 files and 19.7M samples,
+`H(m | prev, prev2)` is 4.584 bits and `H(r | m, prev r)` is 0.995, for 5.578
+bits/sample. The coder reaches 2.791x against that, about **97%** of its own model's
+ceiling. The remaining headroom is in the model class, not in tuning.
 
 Things that were tried and did not help, with numbers, so nobody repeats them:
 
 - **Coding `q = round(x/64)` and the offset separately** rather than differencing
   first: 2.25x. The sample offset costs 2.52 bits where the *difference* jitter
   costs 1.23.
-- **Lattice phase as a context.** The decoder knows `x[n-1] mod 64` for free, but
-  `H(r | phase, m)` is 0.971 against 0.969 for the context already in use.
+- **Lattice phase as a context.** The decoder knows `x[n-1] mod 64` for free, but on
+  a common 20-file sample `H(r | phase, m)` measured 0.971 against 0.969 for the
+  context already in use, so it is a wash.
 - **Higher-order predictors on the decimated signal**: order 2 costs 5.21 bits
   against 4.59 for order 1, and it gets worse from there.
 - **Model priming from corpus statistics.** Encoding the same file four times in a
@@ -115,9 +118,26 @@ found and fixed, and the tests exist so they stay fixed:
 - **`eval.sh` exited 0 after a round-trip failure** and still printed a ratio, so a
   broken build looked like a passing one. It now exits non-zero and prints nothing.
 
-Also hardened: every allocation is checked, the decoder bounds the length fields it
-reads out of a `.bw` before allocating, and short writes are detected rather than
-silently truncating output.
+Also fixed after a second audit pass:
+
+- **The decoder's size bound was dead code.** It tested `dl > 64 GiB`, but `dl` is a
+  `uint32_t` and can never reach that, so a 16-byte crafted header still committed the
+  process to a ~400 MB allocation and a multi-billion-iteration loop. `dl` is now bounded
+  against the bitstream actually present in the file.
+- **A truncated `.bw` decoded to a full-size wrong WAV and exited 0**, because `fgetc`
+  returning EOF was folded into the bit decoder as data. EOF is now counted and the
+  decode aborts.
+- **The model arrays were leaked on every encode and decode** (about 50 KB per run).
+- Signed overflow in the decoder's sample accumulator on corrupt input is now defined
+  unsigned wraparound.
+
+Every allocation is checked and short writes are detected rather than silently
+truncating output.
+
+Still true and worth stating plainly: the `.bw` format carries **no checksum**, so a
+bit-flipped stream that survives the size bounds will decode to wrong samples without
+complaint. For a submission measured by `eval.sh` that is not a defect, but it is not
+an archival format.
 
 **Endianness.** Samples are read native-endian and the `.bw` header stores its
 length fields as native-endian `uint32`. That is fine on any little-endian host,

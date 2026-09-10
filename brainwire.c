@@ -1,16 +1,21 @@
 /* Neuralink compression challenge: lossless codec for N1 electrode recordings.
  *
- * Signal facts this exploits, measured over 743 files (~73M samples):
- *   - samples sit on a 64-step lattice: 72.8% of first differences are exact
- *     multiples of 64, and 99.98% are 64k, 64k+1 or 64k-1.
+ * Signal facts this exploits, measured over all 743 files (73,383,174 first
+ * differences):
+ *   - samples sit on a 64-step lattice: 67.8% of first differences are exact
+ *     multiples of 64, and 99.27% are 64k, 64k+1 or 64k-1.
  *   - because of that lattice, a=1.0 is the optimal first-order coefficient.
- *     Fractional and LPC predictors break the alignment and cost 3-5 bits/sample.
- *   - first-difference entropy is ~5.5 b/sample; magnitude context modeling
- *     buys under 0.03 bits, so the residual is near-memoryless.
+ *     The cheapest alternative coefficient costs +2.4 bits/sample and the worst
+ *     +4.6, so fractional and LPC predictors break the alignment badly.
+ *   - first-difference entropy is 5.540 b/sample; magnitude context modeling
+ *     buys under 0.02 bits, so the residual is near-memoryless in magnitude.
  *
- * So: first difference, then a bitwise adaptive binary range coder. The per-bit
- * contexts learn the "low six bits are usually zero" structure on their own,
- * which is what a Rice coder cannot express and why Rice loses ~5 bits here.
+ * So: first difference, then split each residual on the lattice into the comb
+ * tooth m = round(d/64) and the jitter r = d - 64m, each coded with an adaptive
+ * binary range coder. Coding d straight through the same binarizer gives only
+ * 1.72x, because a length-plus-mantissa code has to spend full bits on the comb
+ * structure; Rice does worse still at 1.48x, since the residual is a comb rather
+ * than the geometric distribution Rice assumes.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,7 +24,7 @@
 
 /* ---------- binary range coder (LZMA-style, carry-propagating) ---------- */
 typedef struct { uint64_t low; uint32_t range; FILE *f; uint64_t cache; int cachesz; } Enc;
-typedef struct { uint32_t code, range; FILE *f; } Dec;
+typedef struct { uint32_t code, range; FILE *f; int eof; } Dec;
 
 static void enc_init(Enc *e, FILE *f){ e->low=0; e->range=0xFFFFFFFF; e->f=f; e->cache=0; e->cachesz=1; }
 static void enc_shift(Enc *e){
@@ -42,13 +47,14 @@ static void enc_bit(Enc *e, uint16_t *p, int bit){
 }
 static void enc_flush(Enc *e){ for (int i=0;i<5;i++) enc_shift(e); }
 
-static void dec_init(Dec *d, FILE *f){ d->range=0xFFFFFFFF; d->code=0; fgetc(f);
-    for (int i=0;i<4;i++) d->code=(d->code<<8)|(uint32_t)(fgetc(f)&0xFF); d->f=f; }
+static int dec_byte(Dec *d){ int c=fgetc(d->f); if (c==EOF){ d->eof++; return 0; } return c&0xFF; }
+static void dec_init(Dec *d, FILE *f){ d->range=0xFFFFFFFF; d->code=0; d->f=f; d->eof=0; dec_byte(d);
+    for (int i=0;i<4;i++) d->code=(d->code<<8)|(uint32_t)dec_byte(d); }
 static int dec_bit(Dec *d, uint16_t *p){
     uint32_t bound = (d->range>>12) * (*p); int bit;
     if (d->code < bound) { d->range = bound; *p += (4096-*p)>>6; bit=0; }
     else { d->code -= bound; d->range -= bound; *p -= *p>>6; bit=1; }
-    while (d->range < (1u<<24)) { d->range<<=8; d->code=(d->code<<8)|(uint32_t)(fgetc(d->f)&0xFF); }
+    while (d->range < (1u<<24)) { d->range<<=8; d->code=(d->code<<8)|(uint32_t)dec_byte(d); }
     return bit;
 }
 
@@ -149,7 +155,7 @@ static int do_encode(const char *in, const char *out){
           b2=b1; b1=bm; pr=r; }
         prev=v;
     }
-    enc_flush(&e); fclose(fo); free(buf); return 0;
+    enc_flush(&e); fclose(fo); free(buf); free(Mm); free(Me); return 0;
 }
 
 static int do_decode(const char *in, const char *out){
@@ -161,8 +167,16 @@ static int do_decode(const char *in, const char *out){
      * size before allocating, so a corrupt or hostile .bw cannot ask for
      * gigabytes or spin the decode loop for hours. */
     long here=ftell(fi); fseek(fi,0,SEEK_END); long fsz=ftell(fi); fseek(fi,here,SEEK_SET);
-    if ((uint64_t)hl + tl > (uint64_t)fsz || (dl & 1u) ||
-        (uint64_t)dl > 64ull*1024*1024*1024) { fprintf(stderr,"corrupt stream\n"); return 1; }
+    long payload = fsz - here - (long)hl - (long)tl;   /* bytes of coded bitstream available */
+    /* Bound dl against the bitstream actually present. Each sample costs at least
+     * one binary decision for m and one for r, so it cannot cost arbitrarily little.
+     * 64 samples per payload byte is far past anything the coder can achieve and
+     * still stops a 16-byte header from committing us to a multi-GB allocation.
+     * The earlier 64GiB test could never fire: dl is a uint32_t. */
+    if ((uint64_t)hl + tl > (uint64_t)fsz || (dl & 1u) || payload < 0 ||
+        (uint64_t)dl > (uint64_t)(payload + 64) * 128) {
+        fprintf(stderr,"corrupt stream\n"); return 1;
+    }
     uint8_t *hdr=xmalloc(hl); if (fread(hdr,1,hl,fi)!=hl) return 1;
     uint8_t *tail=NULL; if (tl){ tail=xmalloc(tl); if (fread(tail,1,tl,fi)!=tl) return 1; }
     long nsamp=dl/2; int16_t *s=xmalloc(dl);
@@ -179,14 +193,19 @@ static int do_decode(const char *in, const char *out){
         int rc = pr<-3?-3:(pr>3?3:pr);
         int32_t r=get_val(&d,&Me[bm*7+rc+3]);
         b2=b1; b1=bm; pr=r;
-        prev += 64*m + r; s[i]=(int16_t)prev;
+        prev = (int32_t)((uint32_t)prev + (uint32_t)(64*m + r));  /* defined wrap on corrupt input */
+        s[i]=(int16_t)prev;
+        if (d.eof > 8) { fprintf(stderr,"truncated stream\n");
+                         free(hdr); free(s); free(tail); free(Mm); free(Me); fclose(fi); return 1; }
     }
     fclose(fi);
     FILE *fo=fopen(out,"wb"); if(!fo){perror(out);return 1;}
     int wok = (fwrite(hdr,1,hl,fo)==hl) && (fwrite(s,1,dl,fo)==dl)
               && (!tl || fwrite(tail,1,tl,fo)==tl);
-    if (fclose(fo)!=0 || !wok) { fprintf(stderr,"short write to %s\n",out); return 1; }
-    free(hdr); free(s); free(tail); return 0;
+    int cok = (fclose(fo)==0);
+    free(hdr); free(s); free(tail); free(Mm); free(Me);
+    if (!cok || !wok) { fprintf(stderr,"short write to %s\n",out); return 1; }
+    return 0;
 }
 
 int main(int argc,char**argv){

@@ -4,3 +4,5 @@ data/
 *.bw
 *.dec.wav
 *.o
+.runstory/
+data
