@@ -58,9 +58,7 @@ static int dec_bit(Dec *d, uint16_t *p){
  * 342 probabilities, about 700 bytes of state.
  */
 #define NLEN 20
-#define MB 5          /* m magnitude buckets */
-#define NMCTX (MB*MB)  /* m model: bucket(prev m) x bucket(prev2 m) */
-#define NRCTX (MB*7)   /* r model: bucket(m) x prev r */
+#define NCTX 4
 typedef struct { uint16_t len[NLEN]; uint16_t mant[NLEN][20]; } Model;
 static void model_init(Model *m){
     for (int i=0;i<NLEN;i++){ m->len[i]=2048; for (int j=0;j<20;j++) m->mant[i][j]=2048; }
@@ -109,22 +107,19 @@ static int do_encode(const char *in, const char *out){
     fwrite(buf,1,doff,fo);
     if (tail>0) fwrite(buf+doff+dlen,1,tail,fo);
     Enc e; enc_init(&e,fo);
-    Model *Mm=malloc(sizeof(Model)*NMCTX), *Me=malloc(sizeof(Model)*NRCTX);
-    for (int i=0;i<NMCTX;i++) model_init(&Mm[i]);
-    for (int i=0;i<NRCTX;i++) model_init(&Me[i]);
-    int b1=0,b2=0,pr=0;
+    Model Mm[NCTX], Me[NCTX];
+    for (int i=0;i<NCTX;i++){ model_init(&Mm[i]); model_init(&Me[i]); }
+    int ctx=0;
     const int16_t *s=(const int16_t*)(buf+doff);
     int32_t prev=0;
     for (long i=0;i<nsamp;i++){
         int32_t v=s[i], d=v-prev, m, r;
         m = (d>=0) ? (d+32)/64 : -((-d+32)/64);   /* comb tooth */
         r = d - 64*m;                             /* jitter, |r|<=32 */
-        put_val(&e,&Mm[b1*MB+b2],m);
-        { int am=m<0?-m:m;
-          int bm = am==0?0:(am==1?1:(am<3?2:(am<6?3:4)));
-          int rc = pr<-3?-3:(pr>3?3:pr);
-          put_val(&e,&Me[bm*7+rc+3],r);
-          b2=b1; b1=bm; pr=r; }
+        put_val(&e,&Mm[ctx],m);
+        { int am = m<0?-m:m; int ec = am==0?0:(am==1?1:(am<4?2:3));
+          put_val(&e,&Me[ec],r);
+          ctx = ec; }
         prev=v;
     }
     enc_flush(&e); fclose(fo); free(buf); return 0;
@@ -139,18 +134,15 @@ static int do_decode(const char *in, const char *out){
     uint8_t *tail=NULL; if (tl){ tail=malloc(tl); if (fread(tail,1,tl,fi)!=tl) return 1; }
     long nsamp=dl/2; int16_t *s=malloc(dl);
     Dec d; dec_init(&d,fi);
-    Model *Mm=malloc(sizeof(Model)*NMCTX), *Me=malloc(sizeof(Model)*NRCTX);
-    for (int i=0;i<NMCTX;i++) model_init(&Mm[i]);
-    for (int i=0;i<NRCTX;i++) model_init(&Me[i]);
-    int b1=0,b2=0,pr=0;
+    Model Mm[NCTX], Me[NCTX];
+    for (int i=0;i<NCTX;i++){ model_init(&Mm[i]); model_init(&Me[i]); }
+    int ctx=0;
     int32_t prev=0;
     for (long i=0;i<nsamp;i++){
-        int32_t m=get_val(&d,&Mm[b1*MB+b2]);
-        int am=m<0?-m:m;
-        int bm = am==0?0:(am==1?1:(am<3?2:(am<6?3:4)));
-        int rc = pr<-3?-3:(pr>3?3:pr);
-        int32_t r=get_val(&d,&Me[bm*7+rc+3]);
-        b2=b1; b1=bm; pr=r;
+        int32_t m=get_val(&d,&Mm[ctx]);
+        int am = m<0?-m:m; int ec = am==0?0:(am==1?1:(am<4?2:3));
+        int32_t r=get_val(&d,&Me[ec]);
+        ctx = ec;
         prev += 64*m + r; s[i]=(int16_t)prev;
     }
     fclose(fi);

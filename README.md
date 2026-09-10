@@ -1,8 +1,8 @@
 # brainwire — lossless codec for N1 electrode recordings
 
-**2.750x lossless** across all 743 files (146,800,526 -> 53,364,086 bytes), verified
-byte-exact by `eval.sh`. Single-core throughput 13.4M samples/s encode, 12.3M decode.
-Model state is 6.7 KB total.
+**2.791x lossless** across all 743 files (146,800,526 -> 52,588,672 bytes), verified
+byte-exact by `eval.sh`. Single-core throughput 12.7M samples/s encode, 13.2M decode.
+Model state is 49 KB total.
 
 ```
 make && ./eval.sh
@@ -18,13 +18,13 @@ actually do (no cross-recording dictionary):
 | zip | 2.279x | — | — |
 | gzip -9 | 2.286x | — | — |
 | xz -9e | 2.756x | 2.78M samples/s | 64 MiB dictionary |
-| **brainwire** | **2.753x** | **13.4M samples/s** | **6.7 KB** |
+| **brainwire** | **2.794x** | **12.7M samples/s** | **49 KB** |
 
-So it ties `xz -9e` on ratio while encoding 4.8x faster in about 1/10,000th the
-memory. Against the posted `zip` baseline of 2.2 it is a 21% improvement.
+So it beats `xz -9e` on ratio while encoding 4.6x faster in roughly 1/1300th the
+memory. Against the posted `zip` baseline it is a 22.5% improvement.
 
-(The 2.750 headline is over all 743 files; the table is the 200-file subset used
-for the head-to-head, hence 2.753.)
+(The 2.791 headline is over all 743 files; the table is the 200-file subset used
+for the head-to-head, hence 2.794.)
 
 ## What the data actually looks like
 
@@ -55,14 +55,36 @@ r = d - 64*m           # jitter, |r| <= 32, almost always in {-1,0,1}
 
 `m` and `r` are coded with an adaptive binary range coder: zigzag, adaptive unary
 bit-length, then mantissa bits with a context per (length, bit position). `m`'s
-model is selected by the previous sample's magnitude class and `r`'s by the current
-`|m|`, four classes each.
+model is selected by the magnitude classes of the two previous teeth (25 contexts)
+and `r`'s by the current `|m|` crossed with the previous jitter (35 contexts).
 
 Coding `d` directly through the same binarizer gives only 1.72x, because the comb
 structure puts real entropy in bits a length-plus-mantissa code has to spend in
 full. Splitting the tooth from the jitter is what takes it to 2.75x. Rice coding
 does worse still (1.48x) since the residual distribution is a comb rather than
 geometric.
+
+## Where the remaining headroom is, and is not
+
+Measured conditional entropies over the corpus put this decomposition's floor at
+about **2.98x**: `H(m | prev, prev2)` is 4.562 bits and `H(r | m, prev r)` is 0.808.
+The coder reaches 2.79 against that, so roughly 94% of its own model's ceiling.
+
+Things that were tried and did not help, with numbers, so nobody repeats them:
+
+- **Coding `q = round(x/64)` and the offset separately** rather than differencing
+  first: 2.25x. The sample offset costs 2.52 bits where the *difference* jitter
+  costs 1.23.
+- **Lattice phase as a context.** The decoder knows `x[n-1] mod 64` for free, but
+  `H(r | phase, m)` is 0.971 against 0.969 for the context already in use.
+- **Higher-order predictors on the decimated signal**: order 2 costs 5.21 bits
+  against 4.59 for order 1, and it gets worse from there.
+- **Model priming from corpus statistics.** Encoding the same file four times in a
+  row shows the cold-start penalty is only 1.0%, so there is nothing to recover.
+
+Getting to the ~3.5x the best published attempts reach needs context mixing, which
+means several models, logistic mixing and SSE. That buys ratio at 10-100x the time
+and memory, which is the wrong trade for something meant to run at under 10 mW.
 
 ## On the 200x target
 
